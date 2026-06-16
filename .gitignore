@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# remove the local files
+*.bkp
+bin/*
+*.txt
+*.png
+*.pptx
+*.drawio
+*.pdf
+*.docx
+*.xlsx
+*.csv
+*.json
+*.jpg
