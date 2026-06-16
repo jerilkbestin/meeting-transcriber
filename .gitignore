@@ -221,6 +221,7 @@ __marimo__/
 *.bkp
 bin/*
 *.txt
+!requirements-windows.txt
 *.png
 *.pptx
 *.drawio
