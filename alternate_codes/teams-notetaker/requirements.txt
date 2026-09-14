@@ -1,0 +1,17 @@
+# Verified against PyPI on 2026-08-27.
+#
+# PyAudioWPatch is a PortAudio/PyAudio fork that adds WASAPI loopback support.
+# It is Windows-only; on macOS/Linux install nothing here and use `file`/`notes`,
+# or point --system-device at a virtual loopback input.
+PyAudioWPatch>=0.2.12.8 ; sys_platform == "win32"
+
+# Local speech recognition (CTranslate2 backend, runs on CPU or NVIDIA GPU).
+faster-whisper>=1.2.1
+
+# High-quality resampling from the device rate (usually 48 kHz) to Whisper's 16 kHz.
+soxr>=0.5.0
+
+numpy>=1.24
+
+# Notes generation.
+anthropic>=1.0.0
