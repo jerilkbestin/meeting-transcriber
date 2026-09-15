@@ -222,6 +222,7 @@ __marimo__/
 bin/*
 *.txt
 !requirements-windows.txt
+*_notes.md
 *.png
 *.pptx
 *.drawio
@@ -231,3 +232,10 @@ bin/*
 *.csv
 *.json
 *.jpg
+
+transcripts/
+venv/
+notes/
+outputs/
+prompts/
+*.zip

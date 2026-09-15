@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teams-notetaker"
+version = "0.1.0"
+description = "Record a Microsoft Teams call locally, transcribe with Whisper, write notes with Claude."
+requires-python = ">=3.9"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "soxr>=0.5.0",
+    "numpy>=1.24",
+    "anthropic>=1.0.0",
+    "PyAudioWPatch>=0.2.12.8 ; sys_platform == 'win32'",
+]
+
+[project.scripts]
+teams-notetaker = "teams_notetaker.cli:main"
+
+[tool.setuptools]
+packages = ["teams_notetaker"]
