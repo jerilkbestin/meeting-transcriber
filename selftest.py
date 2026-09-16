@@ -19,6 +19,7 @@ import wave
 
 import numpy as np
 
+import diarize
 import transcribe
 
 FAILURES = []
@@ -788,6 +789,244 @@ def test_record_settings_validation():
         os.environ.pop("WHISPER_RECORD")
 
 
+class _FakeSegmentSpan:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+
+class _FakeAnnotation:
+    # Duck-types the one pyannote.core API diarize.py uses, so the adapter is
+    # tested without installing torch.
+    def __init__(self, tracks):
+        self._tracks = tracks
+
+    def itertracks(self, yield_label=False):
+        for start, end, label in self._tracks:
+            if yield_label:
+                yield _FakeSegmentSpan(start, end), "_", label
+            else:
+                yield _FakeSegmentSpan(start, end), "_"
+
+
+def _turns(*spans):
+    return [diarize.SpeakerTurn(start, end, label) for start, end, label in spans]
+
+
+def test_diarize_lazy_import():
+    # The dependency-isolation guarantee: importing diarize must not drag in
+    # torch, or `transcribe.py` users would pay for a feature they never run.
+    check("diarize imported", "diarize" in sys.modules)
+    check("torch not imported by diarize", "torch" not in sys.modules)
+    check("pyannote not imported by diarize", not any(m.startswith("pyannote") for m in sys.modules))
+
+
+def test_read_wav_mono16_truncated_header():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.wav")
+        samples = (np.sin(np.linspace(0, 20, 8000)) * 0.5).astype(np.float32)
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(transcribe.TARGET_SAMPLE_RATE)
+            handle.writeframes(transcribe.float_to_pcm16(samples).tobytes())
+
+        audio = diarize.read_wav_mono16(path)
+        check("clean wav reads back in full", len(audio) == 8000, str(len(audio)))
+        check("amplitude preserved", abs(float(np.max(audio)) - float(np.max(samples))) < 0.01)
+
+        # Simulate a writer killed before it could patch the header: zero the
+        # data-chunk size. The file length is the ground truth.
+        raw = bytearray(open(path, "rb").read())
+        index = raw.find(b"data")
+        raw[index + 4:index + 8] = (0).to_bytes(4, "little")
+        broken = os.path.join(tmp, "broken.wav")
+        open(broken, "wb").write(bytes(raw))
+
+        with wave.open(broken, "rb") as handle:
+            check("stdlib wave sees a truncated file", handle.getnframes() == 0, str(handle.getnframes()))
+        recovered = diarize.read_wav_mono16(broken)
+        check("truncated header still recovers every sample", len(recovered) == 8000, str(len(recovered)))
+
+
+def test_read_wav_mono16_stereo_and_rate():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "s.wav")
+        left = np.full(1000, 0.5, dtype=np.float32)
+        right = np.full(1000, -0.1, dtype=np.float32)
+        interleaved = np.empty(2000, dtype=np.float32)
+        interleaved[0::2] = left
+        interleaved[1::2] = right
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(2)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(transcribe.float_to_pcm16(interleaved).tobytes())
+
+        audio = diarize.read_wav_mono16(path)
+        check("stereo is downmixed and resampled", len(audio) == 2000, str(len(audio)))
+        check("downmix averages the channels", abs(float(np.mean(audio)) - 0.2) < 0.02, str(np.mean(audio)))
+
+
+def test_turns_from_annotation():
+    annotation = _FakeAnnotation([(3.0, 4.0, "SPEAKER_01"), (0.0, 2.0, "SPEAKER_00")])
+    turns = diarize.turns_from_annotation(annotation)
+    check("turns are sorted by start", [t.start for t in turns] == [0.0, 3.0], str([t.start for t in turns]))
+    check("labels preserved", turns[0].raw == "SPEAKER_00", turns[0].raw)
+
+
+def test_overlap_seconds():
+    check("no overlap", diarize.overlap_seconds(0, 1, 2, 3) == 0.0)
+    check("touching is not overlapping", diarize.overlap_seconds(0, 2, 2, 3) == 0.0)
+    check("partial overlap", diarize.overlap_seconds(0, 2, 1, 3) == 1.0)
+    check("containment", diarize.overlap_seconds(1, 2, 0, 5) == 1.0)
+
+
+def test_assign_speaker():
+    turns = _turns((0.0, 10.0, "A"), (10.0, 20.0, "B"))
+    raw, shares, straddled = diarize.assign_speaker(1.0, 3.0, turns)
+    check("fully contained segment gets its speaker", raw == "A", str(raw))
+    check("shares are reported", round(shares["A"], 3) == 2.0, str(shares))
+    check("contained segment does not straddle", straddled is False)
+
+    # A short interjection in the middle must NOT win the line: this is the
+    # case midpoint-matching gets wrong.
+    interrupted = _turns((0.0, 4.0, "A"), (4.0, 4.3, "B"), (4.3, 9.0, "A"))
+    raw, _, straddled = diarize.assign_speaker(0.0, 9.0, interrupted)
+    check("a backchannel does not steal the line", raw == "A", str(raw))
+    check("a backchannel is not a straddle", straddled is False)
+
+    raw, _, straddled = diarize.assign_speaker(8.0, 12.0, turns)
+    check("a real speaker change is flagged", straddled is True)
+    check("the majority speaker still wins", raw in ("A", "B"), str(raw))
+
+    raw, shares, _ = diarize.assign_speaker(30.0, 31.0, turns)
+    check("no overlap falls back to the nearest turn", raw == "B", str(raw))
+    check("fallback reports no shares", shares == {}, str(shares))
+
+    raw, shares, straddled = diarize.assign_speaker(0.0, 1.0, [])
+    check("no turns means no speaker", raw is None, str(raw))
+
+
+def test_number_others_stable():
+    # (raw_label, segment_start) pairs, as main() collects them.
+    assignments = [("SPEAKER_07", 12.0), ("SPEAKER_02", 3.0), ("SPEAKER_07", 30.0)]
+    naming = diarize.number_others(assignments)
+    check("first voice heard is Others 1", naming["SPEAKER_02"] == "Others 1", str(naming))
+    check("second voice heard is Others 2", naming["SPEAKER_07"] == "Others 2", str(naming))
+    check("only speaking labels are numbered", len(naming) == 2, str(naming))
+
+    reversed_naming = diarize.number_others(list(reversed(assignments)))
+    check("numbering ignores input order", reversed_naming == naming, str(reversed_naming))
+
+    check("unassigned segments are skipped", diarize.number_others([(None, 1.0)]) == {})
+
+
+def test_merge_timeline_ordering():
+    you = diarize.DiarizedLine(offset=5.0, wall=None, stream=transcribe.SOURCE_YOU, text="mine")
+    other = diarize.DiarizedLine(offset=1.0, wall=None, stream=transcribe.SOURCE_OTHERS, text="theirs")
+    tie = diarize.DiarizedLine(offset=5.0, wall=None, stream=transcribe.SOURCE_OTHERS, text="tie")
+    merged = diarize.merge_timeline([you, other, tie])
+    check("earlier line comes first", merged[0].text == "theirs", merged[0].text)
+    check("You wins an exact tie", merged[1].text == "mine", merged[1].text)
+
+
+def test_format_line():
+    line = diarize.DiarizedLine(offset=65.0, wall=1757000000.0, stream=transcribe.SOURCE_OTHERS, text="hello")
+    line.label = "Others 2"
+    line.straddled = True
+
+    check("offset mode uses the session clock", diarize.format_line(line, use_offsets=True) == "[00:01:05] Others 2: hello")
+    wall_rendered = diarize.format_line(line)
+    check("wall mode uses HH:MM:SS", len(wall_rendered.split("]")[0]) == 9, wall_rendered)
+    check("uncertainty is off by default", "[?]" not in wall_rendered, wall_rendered)
+    check("uncertainty can be marked", diarize.format_line(line, True, True).endswith("[?]"))
+
+    clockless = diarize.DiarizedLine(offset=1.0, wall=None, stream=transcribe.SOURCE_YOU, text="x")
+    check("a missing clock falls back to offsets", diarize.format_line(clockless) == "[00:00:01] You: x")
+
+
+def test_resolve_hf_token():
+    check("env token wins", diarize.resolve_hf_token({"HF_TOKEN": "hf_a"}) == "hf_a")
+    check("second env name is honoured", diarize.resolve_hf_token({"HUGGINGFACE_HUB_TOKEN": "hf_b"}) == "hf_b")
+    check("HF_TOKEN takes precedence", diarize.resolve_hf_token({"HF_TOKEN": "hf_a", "HUGGINGFACE_HUB_TOKEN": "hf_b"}) == "hf_a")
+    check("blank is not a token", diarize.resolve_hf_token({"HF_TOKEN": "   "}) in (None, diarize.resolve_hf_token({})))
+
+
+def test_report_diarizer_load_failure_messages():
+    missing = diarize.report_diarizer_load_failure(ImportError("No module named 'pyannote'"))
+    check("missing package points at the requirements file", diarize.REQUIREMENTS_FILE in missing, missing)
+    check("missing package says transcribe.py is unaffected", "transcribe.py does not need it" in missing)
+
+    gated = diarize.report_diarizer_load_failure(RuntimeError("401 Client Error: Unauthorized, repo is gated"))
+    check("gated error links the model page", diarize.MODEL_URL in gated, gated)
+    check("gated error links the token page", diarize.TOKEN_URL in gated, gated)
+
+    offline = diarize.report_diarizer_load_failure(RuntimeError("LocalEntryNotFoundError: offline mode"))
+    check("offline error explains the cache", "cache" in offline.lower(), offline)
+
+    network = diarize.report_diarizer_load_failure(RuntimeError("Connection timed out"))
+    check("network error is classified", "huggingface.co" in network, network)
+
+    other = diarize.report_diarizer_load_failure(RuntimeError("something else entirely"))
+    check("unclassified errors still surface", "something else entirely" in other, other)
+
+
+def test_diarize_cli_validation():
+    def run(*flags):
+        return subprocess.run(
+            [sys.executable, "diarize.py", *flags],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+
+    helped = run("--help")
+    check("--help exits 0", helped.returncode == 0, helped.stderr[:200])
+    check("--help documents --num-speakers", "--num-speakers" in helped.stdout)
+    check("--help documents --no-diarize", "--no-diarize" in helped.stdout)
+
+    check("an input is required", run().returncode != 0)
+    check(
+        "exact and bounded speaker counts are exclusive",
+        run("x_streams.json", "--num-speakers", "2", "--min-speakers", "1").returncode != 0,
+    )
+    check(
+        "sidecar and loose wavs are exclusive",
+        run("x_streams.json", "--others-wav", "a.wav").returncode != 0,
+    )
+    check(
+        "min cannot exceed max",
+        run("x_streams.json", "--min-speakers", "5", "--max-speakers", "2").returncode != 0,
+    )
+    missing = run("does_not_exist_streams.json", "--no-diarize")
+    check("a missing sidecar exits non-zero", missing.returncode != 0, missing.stdout[:200])
+
+
+def test_load_streams_sidecar():
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = transcribe.StreamRecorder(os.path.join(tmp, "m.txt"))
+        block = np.full(1600, 0.3, dtype=np.float32)
+        recorder.write(transcribe.SOURCE_YOU, block, 10.0)
+        recorder.write(transcribe.SOURCE_OTHERS, block, 10.5)
+        recorder.close()
+
+        payload = diarize.load_streams_sidecar(recorder.sidecar_path)
+        check("both streams resolved", sorted(payload["streams"]) == ["Others", "You"])
+        check("paths resolved next to the sidecar", os.path.isfile(payload["streams"]["You"]["path"]))
+
+        # A sidecar from a different schema must fail loudly rather than be
+        # half-understood.
+        bad = os.path.join(tmp, "bad_streams.json")
+        with open(bad, "w", encoding="utf-8") as handle:
+            json.dump({"schema": 999, "streams": {}}, handle)
+        try:
+            diarize.load_streams_sidecar(bad)
+            check("an unknown schema is rejected", False, "no error raised")
+        except ValueError as exc:
+            check("an unknown schema is rejected", "schema" in str(exc), str(exc))
+
+
 def main():
     print("=" * 70)
     print("transcribe.py self-test (no audio hardware, no model download)")
@@ -827,6 +1066,19 @@ def main():
         test_stream_recorder_unknown_source,
         test_transcribe_loop_records,
         test_record_settings_validation,
+        test_diarize_lazy_import,
+        test_read_wav_mono16_truncated_header,
+        test_read_wav_mono16_stereo_and_rate,
+        test_turns_from_annotation,
+        test_overlap_seconds,
+        test_assign_speaker,
+        test_number_others_stable,
+        test_merge_timeline_ordering,
+        test_format_line,
+        test_resolve_hf_token,
+        test_report_diarizer_load_failure_messages,
+        test_diarize_cli_validation,
+        test_load_streams_sidecar,
     ]
 
     for test in tests:
