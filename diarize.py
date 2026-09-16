@@ -196,6 +196,15 @@ def read_wav_mono16(path):
 # ---------------------------------------------------------------------------
 
 
+class DiarizerAccessError(RuntimeError):
+    # Raised when the model is reachable but not usable by this account.
+    # pyannote signals that two different ways -- it raises for a gated repo,
+    # but returns None when from_pretrained cannot build the pipeline -- and
+    # both deserve the same "accept the terms" instructions, so the None case
+    # is converted into this type rather than left to string matching.
+    pass
+
+
 def resolve_hf_token(env=None):
     # Deliberately no --hf-token flag: a token on the command line lands in
     # shell history and in `ps` output. Environment first, then whatever
@@ -231,7 +240,13 @@ def report_diarizer_load_failure(exc):
             "transcribe.py does not need it."
         )
 
-    gated = "gatedrepoerror" in lowered or "gated" in lowered or "401" in lowered or "403" in lowered
+    gated = (
+        isinstance(exc, DiarizerAccessError)
+        or "gatedrepoerror" in lowered
+        or "gated" in lowered
+        or "401" in lowered
+        or "403" in lowered
+    )
     if gated:
         return (
             f"access to {MODEL_ID} has not been granted for this account.\n"
@@ -270,9 +285,11 @@ def load_diarizer(token, device):
 
     pipeline = Pipeline.from_pretrained(MODEL_ID, token=token)
     if pipeline is None:
-        # from_pretrained returns None (rather than raising) when the repo is
-        # visible but the terms have not been accepted.
-        raise RuntimeError(
+        # from_pretrained returns None (rather than raising) when it cannot
+        # build the pipeline -- most often because the terms have not been
+        # accepted. Converted to a typed error so the caller reports the same
+        # actionable steps as a raised gated-repo error.
+        raise DiarizerAccessError(
             f"Pipeline.from_pretrained({MODEL_ID!r}) returned None -- this normally "
             "means the model terms have not been accepted, or the token is missing."
         )

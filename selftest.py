@@ -814,11 +814,41 @@ def _turns(*spans):
 
 
 def test_diarize_lazy_import():
-    # The dependency-isolation guarantee: importing diarize must not drag in
-    # torch, or `transcribe.py` users would pay for a feature they never run.
+    # The dependency-isolation guarantee: diarize.py must import and run its
+    # non-diarization paths on a machine with neither torch nor pyannote.
+    #
+    # Asserting `"torch" not in sys.modules` would be the wrong test: once
+    # torch IS installed, ctranslate2/specs/model_spec.py imports it
+    # opportunistically, so faster_whisper -> ctranslate2 -> torch happens via
+    # `import transcribe` and has nothing to do with this module. So instead we
+    # hide both packages and check the import still succeeds.
     check("diarize imported", "diarize" in sys.modules)
-    check("torch not imported by diarize", "torch" not in sys.modules)
-    check("pyannote not imported by diarize", not any(m.startswith("pyannote") for m in sys.modules))
+    check("pyannote not imported at module level", not any(m.startswith("pyannote") for m in sys.modules))
+
+    blocker = (
+        "import sys\n"
+        "class Block:\n"
+        "    def find_module(self, name, path=None):\n"
+        "        if name == 'torch' or name.startswith('pyannote'):\n"
+        "            raise ImportError('hidden by selftest: ' + name)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Block())\n"
+        "import diarize\n"
+        "assert diarize.overlap_seconds(0, 2, 1, 3) == 1.0\n"
+        "assert 'Others 1' in diarize.number_others([('S', 0.0)]).values()\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", blocker],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    check(
+        "diarize imports and works with torch/pyannote hidden",
+        result.returncode == 0 and "OK" in result.stdout,
+        (result.stderr or result.stdout)[-300:],
+    )
 
 
 def test_read_wav_mono16_truncated_header():
@@ -961,6 +991,14 @@ def test_report_diarizer_load_failure_messages():
     gated = diarize.report_diarizer_load_failure(RuntimeError("401 Client Error: Unauthorized, repo is gated"))
     check("gated error links the model page", diarize.MODEL_URL in gated, gated)
     check("gated error links the token page", diarize.TOKEN_URL in gated, gated)
+
+    # pyannote signals "no access" two ways: it raises for a gated repo, but
+    # returns None when from_pretrained cannot build the pipeline. Both must
+    # produce the same instructions.
+    returned_none = diarize.report_diarizer_load_failure(
+        diarize.DiarizerAccessError("from_pretrained returned None")
+    )
+    check("a None pipeline gets the same instructions", diarize.MODEL_URL in returned_none, returned_none)
 
     offline = diarize.report_diarizer_load_failure(RuntimeError("LocalEntryNotFoundError: offline mode"))
     check("offline error explains the cache", "cache" in offline.lower(), offline)

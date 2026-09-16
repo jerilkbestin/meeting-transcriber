@@ -10,7 +10,8 @@ machine by default.
 
 - **macOS** (primary, documented below): `transcribe.py`, `test_audio.py`, and
   `audio_route.swift` capture audio via a [BlackHole](https://github.com/ExistentialAudio/BlackHole)
-  loopback driver + Core Audio Multi-Output Device.
+  loopback driver + Core Audio Multi-Output Device. `diarize.py` adds an
+  optional post-meeting pass that splits `Others` into individual speakers.
 - **Windows 11 + NVIDIA**: `transcribe_windows.py` and `test_audio_windows.py`
   — see `WINDOWS_NVIDIA.md` for setup.
 
@@ -222,6 +223,34 @@ auto-detects `BlackHole 2ch` as its "Others" input.
   thread simply no longer being alive) and exits loudly with a full
   traceback and the partial-transcript path, instead of continuing to run
   with no more output.
+- **Diarization is a post-meeting pass, not a live one.** pyannote clusters
+  speakers *within* the audio it is handed, so diarizing each 12-28s chunk
+  live would produce labels that are only locally consistent: "Speaker 1" in
+  one chunk need not be the same human as "Speaker 1" in the next. Keeping
+  identities stable across a whole meeting would mean maintaining an embedding
+  bank and doing incremental clustering — real complexity, and a drift risk —
+  on a CPU that is already decoding. One pass over the finished recording
+  clusters globally, costs nothing live, and is simply more accurate.
+- **The recorder taps before `prepare_audio`, not after.** The transcription
+  path deliberately destroys two things the diarizer needs: near-silent chunks
+  are dropped outright, and AGC rescales what survives. Silence is precisely
+  what separates one speaker turn from the next, so the WAV is written from
+  the resampled-but-otherwise-untouched audio.
+- **The post pass re-transcribes instead of reusing the live text.** Not
+  because the live text is unanchored — since timestamps come from capture
+  time it sits on a real timeline — but because the `.txt` keeps whole seconds
+  only, and overlap-based speaker assignment needs float segment boundaries.
+  Re-decoding also buys the `max` preset (beam 5, word timestamps), which live
+  capture cannot afford and a post pass gets for free.
+- **Recording is wall-clock anchored, with gaps filled.** Each block carries
+  the capture timestamp the transcriber already reads in the audio callback.
+  If PortAudio drops blocks, plain concatenation would silently compress that
+  stream's timeline and slide every later timestamp earlier, so a shortfall
+  beyond 50 ms is filled with silence instead. A backwards clock step (NTP) is
+  counted in the sidecar but never repaired by discarding audio. Two devices
+  on independent crystals still drift; the residual error is bounded by the
+  tolerance plus block jitter, which is well under the one-second display
+  granularity. This is not sample-accurate sync and does not claim to be.
 
 ---
 
@@ -316,7 +345,73 @@ auto-detects `BlackHole 2ch` as its "Others" input.
   interactive prompts. Otherwise the live path: list devices → resolve
   BlackHole → pick mic → ask filename → load the model (local mode only) →
   start the worker → open both input streams at their native rates → sleep
-  until `Ctrl+C`, watching for the worker thread dying.
+  until `Ctrl+C`, watching for the worker thread dying. With `--record` it also
+  builds a `StreamRecorder` and closes it in a `finally`, so the WAV headers
+  and sidecar are finalized on every exit path.
+- **`float_to_pcm16(audio)`** — clip to `[-1, 1]` and convert to `int16`.
+  Extracted from `encode_wav_bytes` so the remote encoder and the recorder
+  cannot drift apart. The clip matters: AGC can push a sample past 1.0, and an
+  unclipped conversion wraps it into loud noise of the opposite sign.
+- **`detect_gap_frames(expected, written, tolerance)`** — pure; how many
+  silence frames to insert so a WAV stays aligned to the wall clock. Returns 0
+  within tolerance and on negative drift.
+- **`StreamRecorder`** — one 16 kHz mono WAV per source plus the
+  `_streams.json` sidecar. `write()` lazily opens on the first block,
+  gap-fills, appends and flushes; `close()` finalizes headers and writes the
+  sidecar atomically (`os.replace`); `sidecar_payload()` builds the dict
+  without touching disk, so its shape is testable on its own. Its single lock
+  guards teardown (the main thread closing while the worker writes), not the
+  hot path.
+
+---
+
+## Code walkthrough (`diarize.py`)
+
+- **`load_streams_sidecar(path)`** — reads and validates the `_streams.json`
+  contract, rejecting an unknown schema rather than half-understanding it, and
+  resolves each WAV relative to the sidecar (they are stored as basenames, so
+  the whole set can be copied to another machine).
+- **`_parse_riff(path)` / `read_wav_mono16(path)`** — walks the RIFF chunks by
+  hand instead of using the `wave` module, because a recorder killed mid-write
+  can leave a stale `data` size that `wave` would silently honour, handing back
+  a truncated recording with no error. The file length is the ground truth.
+  Returns float32 mono at 16 kHz, downmixing and resampling (via the
+  transcriber's own resampler) so externally recorded audio also works.
+- **`resolve_hf_token(env)`** — `HF_TOKEN` → `HUGGINGFACE_HUB_TOKEN` →
+  `huggingface_hub.get_token()` → `None`. There is deliberately no
+  `--hf-token` flag: a token on the command line lands in shell history and in
+  `ps` output. `None` is valid once the model is cached.
+- **`DiarizerAccessError` / `report_diarizer_load_failure(exc)`** — pyannote
+  signals "no access" two ways: it raises for a gated repo, but *returns None*
+  when `from_pretrained` cannot build the pipeline. The None case is converted
+  into a typed error so both produce the same actionable steps. The reporter
+  returns the message rather than printing it, mirroring
+  `transcribe.report_remote_health_failure`, which is what makes it testable.
+- **`load_diarizer(token, device)` / `diarize_audio(...)`** — the only
+  functions that touch torch, imported inside the function bodies. Audio is fed
+  as an in-memory waveform dict rather than a path, which keeps
+  torchcodec/ffmpeg out of the path entirely. Prefers
+  `exclusive_speaker_diarization` (one speaker per instant), which suits
+  attributing a whole transcript segment to a single speaker.
+- **`turns_from_annotation(annotation)`** — reads turns via
+  `itertracks(yield_label=True)`; bare `__iter__` changed shape between
+  pyannote.core 5 and 6, `itertracks` did not.
+- **`overlap_seconds` / `speaker_overlap_shares` / `assign_speaker`** — assign
+  each segment to the speaker holding the most overlap. Midpoint matching would
+  let a 0.3s backchannel that happens to land mid-segment steal the whole line.
+  Falls back to the nearest turn when Whisper and the VAD disagree about where
+  speech starts, and to no speaker at all when the diarizer found none.
+- **`number_others(assignments)`** — maps raw `SPEAKER_NN` labels to
+  `Others 1`, `Others 2`, … by first appearance. pyannote's own numbering comes
+  out of clustering and is not stable between runs, so it is never displayed.
+  Only labels that actually won a segment are numbered, so the transcript can
+  never mention an `Others 3` with no lines.
+- **`transcribe_stream` / `merge_timeline` / `format_line` /
+  `write_diarized_outputs`** — decode one WAV through
+  `transcribe.build_decode_options` (so this pass cannot drift from the live
+  path's parameters), merge both streams by session time with `You` first on
+  an exact tie, and render `[HH:MM:SS] Label: text` on the same wall clock the
+  live transcript used.
 
 ---
 
@@ -398,7 +493,7 @@ Each flag falls back to an environment variable, then a built-in default:
 
 | Flag | Env var | Default | Purpose |
 | --- | --- | --- | --- |
-| `--accuracy` | `WHISPER_ACCURACY` | `fast` | preset setting model, beam, chunk length, compute type and threads together |
+| `--accuracy` | `WHISPER_ACCURACY` | `balanced` | preset setting model, beam, chunk length, compute type and threads together |
 | `--model` | `WHISPER_MODEL` | preset | faster-whisper model size (local mode only) |
 | `--min-chunk-seconds` | `WHISPER_MIN_CHUNK_SECONDS` | preset | min seconds before a silence cut is considered |
 | `--max-chunk-seconds` | `WHISPER_MAX_CHUNK_SECONDS` | preset | hard ceiling on seconds per decode; capped at 30s |
@@ -410,6 +505,7 @@ Each flag falls back to an environment variable, then a built-in default:
 | `--initial-prompt` | `WHISPER_INITIAL_PROMPT` | `""` | vocabulary hint (names, acronyms, jargon). **Only biases the first window of each decode call** — in file mode, only the first segment of the whole file |
 | `--input-file` | `WHISPER_INPUT_FILE` | `""` | transcribe this audio file instead of live capture; skips mic/BlackHole |
 | `--remote-url` | `WHISPER_REMOTE_URL` | `""` | run inference on a remote faster-whisper server instead of locally; see Remote (GPU) inference below |
+| `--record` | `WHISPER_RECORD` | off | also write one 16 kHz mono WAV per stream plus a `_streams.json` sidecar, for the post-meeting diarization pass; see Speaker diarization below |
 
 `--model`, `--beam-size`, `--compute-type` and `--cpu-threads` are ignored when
 `--remote-url` is set — the remote server controls its own model. You are told
@@ -511,6 +607,51 @@ python transcribe.py --remote-url http://192.168.77.1:8000
   server design. Until that exists, `--remote-url` will fail its startup
   health check.
 
+### Speaker diarization (post-meeting, optional)
+
+`You` and `Others` are already exact — your mic is a physically separate
+stream, so the local speaker is known rather than guessed. Diarization only
+has to answer the remaining question: *which* remote participant is speaking
+inside the mixed `Others` stream. `diarize.py` does that after the meeting.
+
+```bash
+# One-time setup
+pip install -r requirements-diarize.txt      # pulls torch; ~1 GB installed
+# Accept the model terms at
+#   https://huggingface.co/pyannote/speaker-diarization-community-1
+# then create a read token at https://huggingface.co/settings/tokens
+export HF_TOKEN=hf_...                        # or: hf auth login
+
+# 1. Record the meeting as well as transcribing it
+python transcribe.py --record
+
+# 2. Afterwards, split "Others" into individual speakers
+python diarize.py transcripts/<name>_<timestamp>_streams.json
+```
+
+Output, beside the live transcript:
+
+```text
+[10:15:03] You: right, let's get started
+[10:15:07] Others 1: sounds good, I'll share my screen
+[10:15:19] Others 2: can you make that a bit bigger
+```
+
+Useful flags: `--num-speakers N` (or `--min-speakers`/`--max-speakers`) when
+you know the headcount, `--offsets` to timestamp from session start instead of
+wall clock, `--mark-uncertain` to flag lines that straddle a speaker change,
+`--skip-you`, and `--no-diarize` to re-transcribe and merge without pyannote
+(useful for checking the pipeline before installing torch). `--device mps` is
+opt-in: some pyannote operations fall back to CPU and can end up slower.
+
+Notes:
+
+- The model is gated but free (CC-BY-4.0), and runs **fully offline** once
+  cached — verify with `HF_HUB_OFFLINE=1`.
+- The recording costs roughly 230 MB per hour for both streams.
+- Installing torch also slows `transcribe.py` startup by about a second:
+  `ctranslate2` imports torch opportunistically when it is present.
+
 ---
 
 ## Project status
@@ -520,8 +661,13 @@ python transcribe.py --remote-url http://192.168.77.1:8000
 - **Phase 2 — Dual stream (You + Others):** ✅ implemented. `switch_meeting_output`
   (Swift) manages routing; `transcribe.py` auto-detects BlackHole and labels
   `You` / `Others`.
-- **Phase 3 — Speaker diarization:** ⬜ not started (planned: `pyannote.audio`
-  to label individual speakers instead of just `Others`).
+- **Phase 3 — Speaker diarization:** ✅ implemented as a post-meeting pass.
+  `transcribe.py --record` writes one WAV per stream plus a `_streams.json`
+  sidecar; `diarize.py` re-transcribes them, runs
+  `pyannote/speaker-diarization-community-1` over the `Others` stream, and
+  writes `<name>_diarized.txt` / `.json` with `Others 1`, `Others 2`, …
+  ⬜ Remaining: accept the model terms on Hugging Face and set `HF_TOKEN`
+  once, then run it against a real meeting.
 - **AUDIT.md findings:** ✅ all 6 resolved (adaptive chunking, hallucination
   filter, carry-forward prompt, native sample rate + resample, worker crash
   detection, narrow exception handling) — see `docs/AUDIT.md`.
@@ -540,3 +686,10 @@ See `project.md` and `phase2_audio_routing_plan.md` for the full brief, and
 - faster-whisper: <https://github.com/SYSTRAN/faster-whisper>
 - python-sounddevice streams API:
   <https://python-sounddevice.readthedocs.io/en/0.5.1/api/streams.html>
+- pyannote speaker-diarization-community-1 (model card, gating, `token=`,
+  waveform input, `exclusive_speaker_diarization`):
+  <https://huggingface.co/pyannote/speaker-diarization-community-1>
+- pyannote.audio releases (4.0 breaking changes, torchcodec, Python ≥ 3.10):
+  <https://github.com/pyannote/pyannote-audio/releases>
+- Why community-1 over 3.1, and what exclusive diarization is for:
+  <https://www.pyannote.ai/blog/community-1>
