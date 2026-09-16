@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import wave
 
 import numpy as np
 
@@ -69,6 +71,7 @@ def _make_namespace(**overrides):
         initial_prompt="",
         input_file="",
         remote_url="",
+        record=False,
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -613,6 +616,178 @@ def test_line_timestamp_uses_capture_time():
     check("missing clock still produces a timestamp", len(transcribe.line_timestamp(None, 0.0)) == 8)
 
 
+def _read_wav(path):
+    with wave.open(path, "rb") as handle:
+        frames = handle.getnframes()
+        raw = handle.readframes(frames)
+        return handle.getnchannels(), handle.getsampwidth(), handle.getframerate(), frames, raw
+
+
+def test_float_to_pcm16():
+    out = transcribe.float_to_pcm16(np.array([0.0, 1.0, -1.0], dtype=np.float32))
+    check("dtype is int16", out.dtype == np.int16, str(out.dtype))
+    check("silence maps to 0", out[0] == 0, str(out[0]))
+    check("full scale maps to +32767", out[1] == 32767, str(out[1]))
+    check("negative full scale maps to -32767", out[2] == -32767, str(out[2]))
+
+    # prepare_audio's gain can overshoot 1.0; wrapping instead of saturating
+    # would turn a loud sample into loud noise of the opposite sign.
+    clipped = transcribe.float_to_pcm16(np.array([4.0, -4.0], dtype=np.float32))
+    check("overshoot saturates positive", clipped[0] == 32767, str(clipped[0]))
+    check("overshoot saturates negative", clipped[1] == -32767, str(clipped[1]))
+
+
+def test_detect_gap_frames():
+    tol = int(transcribe.RECORD_GAP_TOLERANCE_SECONDS * transcribe.TARGET_SAMPLE_RATE)
+    check("aligned stream inserts nothing", transcribe.detect_gap_frames(1000, 1000, tol) == 0)
+    check("jitter under tolerance inserts nothing", transcribe.detect_gap_frames(1000 + tol, 1000, tol) == 0)
+    dropped = transcribe.detect_gap_frames(16000 + 1000, 1000, tol)
+    check("a one-second drop inserts one second", dropped == 16000, str(dropped))
+    check("negative drift never trims", transcribe.detect_gap_frames(500, 5000, tol) == 0)
+
+
+def test_stream_recorder_roundtrip():
+    with tempfile.TemporaryDirectory() as tmp:
+        transcript = os.path.join(tmp, "meeting.txt")
+        recorder = transcribe.StreamRecorder(
+            transcript,
+            source_meta={transcribe.SOURCE_YOU: {"device": "Mic", "device_rate": 48000}},
+        )
+        block = np.full(1600, 0.5, dtype=np.float32)  # 0.1s at 16 kHz
+        t0 = 1000.0
+        recorder.write(transcribe.SOURCE_YOU, block, t0)
+        recorder.write(transcribe.SOURCE_YOU, block, t0 + 0.1)
+        recorder.write(transcribe.SOURCE_OTHERS, block, t0 + 0.05)
+        recorder.close()
+
+        you_path = os.path.join(tmp, "meeting_you.wav")
+        check("You wav exists", os.path.exists(you_path))
+        check("Others wav exists", os.path.exists(os.path.join(tmp, "meeting_others.wav")))
+
+        channels, width, rate, frames, raw = _read_wav(you_path)
+        check("mono", channels == 1, str(channels))
+        check("16-bit", width == 2, str(width))
+        check("16 kHz", rate == transcribe.TARGET_SAMPLE_RATE, str(rate))
+        check("both blocks written", frames == 3200, str(frames))
+        samples = np.frombuffer(raw, dtype=np.int16)
+        check("audio survives the round trip", abs(int(samples[0]) - 16383) <= 2, str(samples[0]))
+
+        sidecar = os.path.join(tmp, "meeting_streams.json")
+        check("sidecar exists", os.path.exists(sidecar))
+        with open(sidecar, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        check("schema is stamped", payload["schema"] == transcribe.SIDECAR_SCHEMA_VERSION)
+        check("sidecar names the transcript", payload["transcript"] == "meeting.txt")
+        check("both streams described", sorted(payload["streams"]) == ["Others", "You"])
+        you = payload["streams"][transcribe.SOURCE_YOU]
+        check("frame count recorded", you["frames"] == 3200, str(you["frames"]))
+        check("capture clock recorded", you["first_block_wall"] == t0, str(you["first_block_wall"]))
+        check("device metadata recorded", you["device"] == "Mic", str(you["device"]))
+        check("wav referenced by basename", you["wav"] == "meeting_you.wav", you["wav"])
+        check("no gaps on a clean stream", you["gap_frames"] == 0, str(you["gap_frames"]))
+
+
+def test_stream_recorder_gap_fill():
+    # PortAudio dropping audio must stretch the file, not compress the
+    # timeline -- otherwise every later diarized timestamp slides earlier.
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = transcribe.StreamRecorder(os.path.join(tmp, "m.txt"))
+        block = np.full(1600, 0.2, dtype=np.float32)  # 0.1s
+        recorder.write(transcribe.SOURCE_OTHERS, block, 500.0)
+        recorder.write(transcribe.SOURCE_OTHERS, block, 501.1)  # 1.0s late
+        recorder.close()
+
+        _, _, _, frames, _ = _read_wav(os.path.join(tmp, "m_others.wav"))
+        check("silence inserted for the drop", frames == 1600 + 16000 + 1600, str(frames))
+        with open(os.path.join(tmp, "m_streams.json"), encoding="utf-8") as handle:
+            stream = json.load(handle)["streams"][transcribe.SOURCE_OTHERS]
+        check("gap frames counted", stream["gap_frames"] == 16000, str(stream["gap_frames"]))
+
+        # A backwards clock step is counted, never repaired by discarding audio.
+        recorder2 = transcribe.StreamRecorder(os.path.join(tmp, "n.txt"))
+        recorder2.write(transcribe.SOURCE_OTHERS, block, 900.0)
+        recorder2.write(transcribe.SOURCE_OTHERS, block, 899.0)
+        recorder2.close()
+        _, _, _, frames2, _ = _read_wav(os.path.join(tmp, "n_others.wav"))
+        check("negative drift keeps every sample", frames2 == 3200, str(frames2))
+        with open(os.path.join(tmp, "n_streams.json"), encoding="utf-8") as handle:
+            stream2 = json.load(handle)["streams"][transcribe.SOURCE_OTHERS]
+        check("negative drift is reported", stream2["negative_drift_events"] == 1)
+
+
+def test_stream_recorder_unknown_source():
+    # Same defensive stance as SourceBuffer.setdefault (AUDIT #4): an
+    # unrecognized label must not raise.
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = transcribe.StreamRecorder(os.path.join(tmp, "m.txt"))
+        recorder.write("Room Mic", np.zeros(160, dtype=np.float32), 5.0)
+        recorder.close()
+        check("unknown label gets its own file", os.path.exists(os.path.join(tmp, "m_room_mic.wav")))
+
+
+def test_transcribe_loop_records():
+    # The regression guard for the tap point: audio quiet enough that
+    # prepare_audio drops it must still reach the WAV, because silence is what
+    # separates speaker turns for the diarizer.
+    quiet = np.full(
+        transcribe.TARGET_SAMPLE_RATE * 30, transcribe.SILENCE_RMS / 10, dtype=np.float32
+    )
+    model = FakeModel([])
+    q = queue.Queue()
+    q.put((transcribe.SOURCE_OTHERS, quiet.reshape(-1, 1), 100.0))
+    worker_error = threading.Event()
+    settings = _make_fake_args(record=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        output_file = os.path.join(tmp, "out.txt")
+        recorder = transcribe.StreamRecorder(output_file)
+        source_rates = {
+            transcribe.SOURCE_YOU: transcribe.TARGET_SAMPLE_RATE,
+            transcribe.SOURCE_OTHERS: transcribe.TARGET_SAMPLE_RATE,
+        }
+        thread = threading.Thread(
+            target=transcribe.transcribe_loop,
+            args=(model, q, output_file, settings, source_rates, worker_error, recorder),
+            daemon=True,
+        )
+        thread.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and not recorder._streams.get(transcribe.SOURCE_OTHERS):
+            time.sleep(0.01)
+        time.sleep(0.2)
+        recorder.close()
+
+        check("worker did not crash", not worker_error.is_set())
+        path = os.path.join(tmp, "out_others.wav")
+        check("silent audio was still recorded", os.path.exists(path))
+        if os.path.exists(path):
+            _, _, _, frames, _ = _read_wav(path)
+            check("every sample reached the wav", frames == len(quiet), str(frames))
+        size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
+        check("prepare_audio still dropped it from the transcript", size == 0, str(size))
+
+
+def test_record_settings_validation():
+    check("record defaults off", _make_fake_args().record is False)
+    check("record is on when asked", _make_fake_args(record=True).record is True)
+
+    try:
+        _make_fake_args(record=True, input_file="/tmp/x.wav")
+        check("--record with --input-file is rejected", False, "no error raised")
+    except ValueError as exc:
+        check("--record with --input-file is rejected", "nothing to record" in str(exc), str(exc))
+
+    os.environ["WHISPER_RECORD"] = "1"
+    try:
+        check("WHISPER_RECORD=1 enables recording", _make_fake_args().record is True)
+    finally:
+        os.environ.pop("WHISPER_RECORD")
+    os.environ["WHISPER_RECORD"] = "0"
+    try:
+        check("WHISPER_RECORD=0 leaves it off", _make_fake_args().record is False)
+    finally:
+        os.environ.pop("WHISPER_RECORD")
+
+
 def main():
     print("=" * 70)
     print("transcribe.py self-test (no audio hardware, no model download)")
@@ -645,6 +820,13 @@ def main():
         test_decode_options_reach_the_model,
         test_remote_fields_projected_from_options,
         test_line_timestamp_uses_capture_time,
+        test_float_to_pcm16,
+        test_detect_gap_frames,
+        test_stream_recorder_roundtrip,
+        test_stream_recorder_gap_fill,
+        test_stream_recorder_unknown_source,
+        test_transcribe_loop_records,
+        test_record_settings_validation,
     ]
 
     for test in tests:
