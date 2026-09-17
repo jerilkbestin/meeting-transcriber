@@ -3,7 +3,7 @@
 **Purpose:** Implementation handoff for Claude Code. Stand up (A) the direct wired link between L1 and L2, and (B) a local Whisper model server on L1 that (C) the transcribing code on L2 calls as its transcription backend.
 **Companion docs:** `jarvis-assistant-designs.md` (Design C), `jarvis-agent-workflows-spec.md`, `PROJECT_INSTRUCTIONS.md`.
 **Date:** 2026-08-24
-**Status:** Decisions settled below; build not started. Placeholders marked `TODO(owner)` must be resolved during build, never invented.
+**Status (2026-09-17):** L1 is configured and running `large-v3-turbo` / CUDA / int8 at `192.168.77.1:8000`, with a peer-scoped firewall rule and the `Jarvis-Whisper` logon task. Eight HTTP/lifecycle tests and real GPU synthetic-speech tests passed. **L2 passed 3/3 pings at 2–3 ms on 2026-09-16, and the owner supplied a successful `/health` response from L2 on 2026-09-17. Speech transcription and latency from L2 remain unverified.** See [`services/whisper`](../services/whisper/README.md) for measured results, runnable commands, and remaining checks. The code sketches below are design context. Placeholders marked `TODO(owner)` must be resolved during build, never invented.
 
 ---
 
@@ -46,7 +46,7 @@ Two L2 sub-paths (network-identical, ~930 Mbps ceiling either way):
 - **ThinkPad:** UE300 USB-A plug -> ThinkPad USB-A port. Simplest, zero extra adapters.
 - **MacBook:** UE300 USB-A plug -> passive USB-A-to-USB-C adapter -> Mac USB-C port.
 
-`TODO(owner)`: choose which machine is L2 (the agent host). This picks the sub-path and determines the client OS in Part A and Part C. It does not change L1.
+Keep both macOS and Windows/PowerShell paths available for L2 (the agent host). Follow the instructions for the machine in use; this guide does not assign L2 a fixed operating system. L1 is unchanged.
 
 ---
 
@@ -125,7 +125,7 @@ New-NetFirewallRule -DisplayName "Jarvis Ollama (link only)" -Direction Inbound 
 
 ### 5.1 Model choice (settled)
 
-`large-v3-turbo`, `int8`, CUDA. Per the SYSTRAN benchmark this peaks around 1.5GB VRAM and posted the lowest WER of the tested set, leaving headroom on the 6GB card for a co-resident LLM. `float16` is available as a quality option if VRAM allows; benchmark both.
+`large-v3-turbo`, `int8`, CUDA. The local synthetic-speech test on 2026-09-16 observed 1,187 MiB GPU memory after int8 inference versus 2,243 MiB for float16, with identical returned text. These are not peak measurements or meeting-audio quality results. Keep int8 as the default; benchmark both on real meetings before making quality or co-resident-LLM capacity claims. The SYSTRAN README's published benchmarks do not substantiate this document's earlier turbo-specific 1.5GB/lowest-WER claim.
 
 ### 5.2 Recommended server: native Windows faster-whisper + FastAPI (primary)
 
@@ -204,7 +204,7 @@ async def transcribe(
 
 Endpoint path `/v1/audio/transcriptions` is chosen to mirror the OpenAI shape so the client can later swap to any OpenAI-compatible server (5.3) with minimal change. The flat `text`/`language`/`duration` fields are kept for compatibility/debugging; the L2 client (`transcribe_chunk_remote` in `transcribe.py`) parses `segments`, not `text`, and defaults missing `no_speech_prob`/`avg_logprob` toward "not a hallucination" if an alternate server implementation omits them.
 
-`TODO(owner/build)`: run the server on boot. Options: a Startup shortcut running `uvicorn`, NSSM as a Windows service, or Task Scheduler at logon. Decide during build.
+**Implemented (2026-09-16), restart checked (2026-09-17):** Task Scheduler task `Jarvis-Whisper` starts the server at user logon. After the owner's restart, the task was Running with a last-run time after boot, `/health` succeeded, and a local synthetic 30-second speech request matched the reference in 4.59 seconds without manually starting the task during the check. This is not a service available before login. See `services/whisper/register-logon-task.ps1` and the service README for evidence and remaining acceptance checks.
 
 ### 5.3 Alternative server: Speaches (batteries-included, Docker)
 
@@ -339,7 +339,6 @@ captions become a requirement.
 - Chunked-file transcription meets the 10 s budget; streaming is only needed for live captions. (From the latency figures above vs. the requirement.)
 
 ### Unknowns (verify during build)
-- **Which L2 machine** hosts the agent (Mac vs ThinkPad) - `TODO(owner)`. Sets the sub-path and client OS.
 - **House Wi-Fi subnet** - must not overlap the chosen link subnet. Check before assigning `192.168.77.0/24`.
 - **int8 vs float16** on the 4050 for the latency/quality trade-off - benchmark on real meeting audio.
 - **CUDA/cuDNN version pinning** on the Strix for the current faster-whisper release - follow the owner's `WINDOWS_NVIDIA.md`; versions drift.
