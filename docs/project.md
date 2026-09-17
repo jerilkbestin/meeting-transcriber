@@ -169,3 +169,7 @@ python transcribe.py --record
 # Step 3 — after the meeting, split "Others" into individual speakers
 python diarize.py transcripts/<name>_<timestamp>_streams.json
 ```
+
+For the full meeting workflow — routing, what to watch during the call, how
+long the post pass takes, naming the speakers, troubleshooting — see
+[`phase3-meeting-guide.md`](phase3-meeting-guide.md).
