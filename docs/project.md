@@ -111,10 +111,11 @@ Build a fully local, privacy-preserving meeting transcription tool for macOS (Ma
 - [x] Record the streams: `transcribe.py --record` → one WAV per source + `_streams.json`
 - [x] Build `diarize.py` (re-transcribe → diarize Others → assign → merge → write)
 - [x] Keep `You` as `You`. The mic is a separate physical stream, so the local speaker is known, not inferred; only `Others` is subdivided.
-- [ ] Install `requirements-diarize.txt` (pyannote.audio 4 + torch)
-- [ ] Accept the model terms at https://huggingface.co/pyannote/speaker-diarization-community-1
-- [ ] Generate a Hugging Face read token at https://huggingface.co/settings/tokens and `export HF_TOKEN=...`
-- [ ] Download the model (one-time, ~1 GB, then fully offline)
+- [x] Install `requirements-diarize.txt` (pyannote.audio 4.0.7 + torch 2.14.0)
+- [x] Accept the model terms at https://huggingface.co/pyannote/speaker-diarization-community-1 (`gated=auto`, access confirmed)
+- [x] Authenticate — `hf auth login` stores the token in `~/.cache/huggingface/token`; no `HF_TOKEN` export needed
+- [x] Download the model (one-time, 32 MB measured, then fully offline)
+- [x] Verify end-to-end on a recorded session, including determinism across two runs
 - [ ] Test on a real Teams meeting
 
 Output format: `[HH:MM:SS] Others 1: <transcribed text>` — the same shape as the live transcript, so the two files are directly comparable.
@@ -130,7 +131,7 @@ Output format: `[HH:MM:SS] Others 1: <transcribed text>` — the same shape as t
 | BlackHole not appearing in Audio MIDI Setup | ✅ Resolved | Installed and detected; the supported remote-audio path |
 | Teams Audio (device 6) produces no audio | 🟡 Known | Virtual device appears silent on this setup, not usable as input |
 | Only one side of conversation captured | ✅ Resolved | Dual-stream capture shipped in Phase 2 |
-| Diarization model not yet downloaded | 🟡 Open | Gated on Hugging Face — accept terms + set `HF_TOKEN` once |
+| Diarization model not yet downloaded | ✅ Resolved | Terms accepted, `hf auth login` done, 32 MB cached; runs offline |
 | L1 GPU inference server (`--remote-url`) | 🟡 Open | Client side done; the Windows FastAPI server is not built — see `project-local-NW-model-setup.md` |
 
 ---
@@ -141,7 +142,7 @@ Output format: `[HH:MM:SS] Others 1: <transcribed text>` — the same shape as t
 # Capture + transcription (all that transcribe.py needs)
 pip install -r requirements.txt
 
-# Post-meeting diarization only — pulls torch, ~1 GB
+# Post-meeting diarization only — pulls torch, ~0.6-1 GB installed
 pip install -r requirements-diarize.txt
 
 # Windows box (separate implementation)

@@ -616,7 +616,7 @@ inside the mixed `Others` stream. `diarize.py` does that after the meeting.
 
 ```bash
 # One-time setup
-pip install -r requirements-diarize.txt      # pulls torch; ~1 GB installed
+pip install -r requirements-diarize.txt      # pulls torch; ~0.6-1 GB installed
 # Accept the model terms at
 #   https://huggingface.co/pyannote/speaker-diarization-community-1
 # then create a read token at https://huggingface.co/settings/tokens
@@ -647,7 +647,13 @@ opt-in: some pyannote operations fall back to CPU and can end up slower.
 Notes:
 
 - The model is gated but free (CC-BY-4.0), and runs **fully offline** once
-  cached — verify with `HF_HUB_OFFLINE=1`.
+  cached — verify with `HF_HUB_OFFLINE=1`. It is small: 32 MB in the HF cache,
+  measured (the older 3.1 pipeline needed ~1 GB).
+- No `HF_TOKEN` export is needed if you run `hf auth login` once — the token
+  is stored in `~/.cache/huggingface/token` and `resolve_hf_token()` falls
+  back to it. After the first download no token is needed at all.
+- Output is deterministic: two runs over the same recording produced
+  byte-identical transcripts (only the generated-at header line differs).
 - The recording costs roughly 230 MB per hour for both streams.
 - Installing torch also slows `transcribe.py` startup by about a second:
   `ctranslate2` imports torch opportunistically when it is present.
@@ -666,8 +672,9 @@ Notes:
   sidecar; `diarize.py` re-transcribes them, runs
   `pyannote/speaker-diarization-community-1` over the `Others` stream, and
   writes `<name>_diarized.txt` / `.json` with `Others 1`, `Others 2`, …
-  ⬜ Remaining: accept the model terms on Hugging Face and set `HF_TOKEN`
-  once, then run it against a real meeting.
+  Verified end-to-end against a recorded session (model access, download,
+  diarization, assignment, merge, and determinism across two runs).
+  ⬜ Remaining: run it against a real multi-speaker Teams meeting.
 - **AUDIT.md findings:** ✅ all 6 resolved (adaptive chunking, hallucination
   filter, carry-forward prompt, native sample rate + resample, worker crash
   detection, narrow exception handling) — see `docs/AUDIT.md`.
