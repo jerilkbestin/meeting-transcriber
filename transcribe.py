@@ -52,6 +52,22 @@ BLACKHOLE_NAME = "BlackHole 2ch"
 TRANSCRIPTS_DIR = "transcripts"
 DEFAULT_LANGUAGE = "en"
 
+# --record: per-source WAV capture for the post-meeting diarization pass
+# (diarize.py). Written next to the transcript, named after it. Audio is
+# recorded at TARGET_SAMPLE_RATE mono, i.e. after the downmix/resample but
+# before prepare_audio's silence gate and AGC, so the WAV sample index is the
+# same coordinate system the transcriber itself buffers in.
+RECORD_SUFFIXES = {"You": "_you.wav", "Others": "_others.wav"}
+RECORD_FALLBACK_SUFFIX = "_stream.wav"
+STREAMS_SIDECAR_SUFFIX = "_streams.json"
+SIDECAR_SCHEMA_VERSION = 1
+# A stream's WAV must stay a faithful function of wall-clock time. PortAudio
+# drops blocks under load (reported as a stream status, never as missing
+# samples), and plain concatenation would silently compress the timeline by
+# exactly the dropped duration. Shortfalls beyond this tolerance are filled
+# with silence instead; below it, normal scheduling jitter is ignored.
+RECORD_GAP_TOLERANCE_SECONDS = 0.05
+
 
 class AccuracyPreset(NamedTuple):
     # One row of ACCURACY_PRESETS. Grouped as a preset rather than as loose
@@ -419,6 +435,7 @@ class Settings(NamedTuple):
     initial_prompt: str
     input_file: str
     remote_url: str
+    record: bool
     explicit: frozenset
 
 
@@ -442,6 +459,16 @@ def supported_compute_types():
         return sorted(ctranslate2.get_supported_compute_types("cpu"))
     except Exception:  # noqa: BLE001 - never let a probe failure stop a meeting
         return ["int8", "int8_float32", "float32"]
+
+
+def _env_flag(name):
+    # Boolean env vars, for flags that have no value to coerce. Anything not in
+    # the truthy set is false, so WHISPER_RECORD=0 and WHISPER_RECORD="" both
+    # mean off rather than "non-empty, therefore on".
+    value = os.getenv(name)
+    if value is None:
+        return False
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def resolve_settings(args, fail):
@@ -507,12 +534,22 @@ def resolve_settings(args, fail):
             "inference is live-capture only for now"
         )
 
+    # --record captures the live input streams; file mode has no streams to
+    # capture, and the input file is already the recording.
+    record = bool(getattr(args, "record", False)) or _env_flag("WHISPER_RECORD")
+    if record and args.input_file.strip():
+        fail(
+            "--record has nothing to record with --input-file; the input file "
+            "is already on disk. Run diarize.py against it directly."
+        )
+
     return Settings(
         accuracy=accuracy,
         language=args.language,
         initial_prompt=args.initial_prompt,
         input_file=args.input_file,
         remote_url=args.remote_url,
+        record=record,
         word_timestamps=preset.word_timestamps,
         hallucination_silence_threshold=preset.hallucination_silence_threshold,
         explicit=frozenset(explicit),
@@ -603,6 +640,14 @@ def parse_args():
         "http://192.168.77.1:8000) to use instead of local inference. "
         "Live-capture only (not combinable with --input-file); the decoder "
         "flags are ignored since the server controls its own model.",
+    )
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="also write each captured stream to a 16 kHz mono WAV next to the "
+        "transcript, plus a _streams.json sidecar, for the post-meeting "
+        "speaker-diarization pass (diarize.py). Roughly 230 MB per hour for "
+        "both streams. Env: WHISPER_RECORD=1",
     )
     args = parser.parse_args()
     return resolve_settings(args, parser.error)
@@ -740,12 +785,21 @@ class RemoteTranscriptionError(RuntimeError):
     pass
 
 
+def float_to_pcm16(audio):
+    # Float samples live in [-1, 1]; WAV wants signed 16-bit. Clipping first
+    # matters because prepare_audio's gain can push a sample past 1.0, and
+    # int16 conversion would wrap that into loud negative noise rather than
+    # saturating. Extracted so the remote encoder and StreamRecorder cannot
+    # drift apart on the conversion.
+    clipped = np.clip(audio, -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16)
+
+
 def encode_wav_bytes(audio):
     # In-memory WAV encoding purely to build the HTTP request body for
-    # transcribe_chunk_remote — not disk write-ahead durability, which stays
-    # out of scope.
-    pcm16 = np.clip(audio, -1.0, 1.0)
-    pcm16 = (pcm16 * 32767.0).astype(np.int16)
+    # transcribe_chunk_remote — not disk write-ahead durability, which is
+    # --record's job (StreamRecorder).
+    pcm16 = float_to_pcm16(audio)
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav_file:
         wav_file.setnchannels(1)
@@ -979,6 +1033,157 @@ class SourceBuffer:
         return audio, start_time
 
 
+def detect_gap_frames(expected_frames, written_frames, tolerance_frames):
+    # How many silence frames to insert before the next block so the WAV stays
+    # aligned to the wall clock. `expected_frames` is where this block's first
+    # sample belongs (derived from its capture time); `written_frames` is where
+    # the file actually ends. Pure, so the policy is testable without disk.
+    #
+    # Negative drift (the file is ahead of the clock) returns 0 rather than
+    # trimming: dropping real audio to satisfy a clock estimate is a worse
+    # failure than a few milliseconds of skew.
+    shortfall = expected_frames - written_frames
+    if shortfall <= tolerance_frames:
+        return 0
+    return int(shortfall)
+
+
+class StreamRecorder:
+    """Writes one 16 kHz mono WAV per source, plus a sidecar describing them.
+
+    Fed from transcribe_loop (the consumer thread), never from the PortAudio
+    callback — disk I/O on the real-time thread is exactly what AUDIT #1
+    forbids. The tap sits after the downmix/resample and before prepare_audio,
+    so the recording keeps the silence and the original levels that the
+    transcription path deliberately throws away.
+
+    The only lock in this class guards teardown: main() calls close() from the
+    main thread while the worker may be mid-write.
+    """
+
+    def __init__(
+        self,
+        transcript_path,
+        source_meta=None,
+        sample_rate=TARGET_SAMPLE_RATE,
+        tolerance_seconds=RECORD_GAP_TOLERANCE_SECONDS,
+    ):
+        self.transcript_path = transcript_path
+        self.sample_rate = sample_rate
+        self.tolerance_frames = int(round(tolerance_seconds * sample_rate))
+        self.source_meta = dict(source_meta or {})
+        base = os.path.splitext(transcript_path)[0]
+        self._base = base
+        self.sidecar_path = base + STREAMS_SIDECAR_SUFFIX
+        self.session_start_wall = time.time()
+        self._streams = {}
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def path_for(self, source):
+        # Unknown labels get a derived name rather than a KeyError — same
+        # defensive stance as SourceBuffer's setdefault (AUDIT #4).
+        suffix = RECORD_SUFFIXES.get(source)
+        if suffix is None:
+            slug = sanitize_filename_component(source).lower()
+            suffix = f"_{slug}.wav" if slug else RECORD_FALLBACK_SUFFIX
+        return self._base + suffix
+
+    def paths(self):
+        return [self.path_for(source) for source in sorted(RECORD_SUFFIXES)]
+
+    def _open(self, source, capture_time):
+        path = self.path_for(source)
+        fileobj = open(path, "wb")
+        writer = wave.open(fileobj, "wb")
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(self.sample_rate)
+        state = {
+            "path": path,
+            "fileobj": fileobj,
+            "writer": writer,
+            "written": 0,
+            "gap_frames": 0,
+            "negative_drift_events": 0,
+            "first_block_wall": capture_time,
+        }
+        self._streams[source] = state
+        return state
+
+    def write(self, source, samples, capture_time=None):
+        with self._lock:
+            if self._closed:
+                return
+            state = self._streams.get(source)
+            if state is None:
+                state = self._open(source, capture_time)
+
+            if capture_time is not None and state["first_block_wall"] is not None:
+                elapsed = capture_time - state["first_block_wall"]
+                expected = int(round(elapsed * self.sample_rate))
+                gap = detect_gap_frames(expected, state["written"], self.tolerance_frames)
+                if gap:
+                    state["writer"].writeframes(np.zeros(gap, dtype=np.int16).tobytes())
+                    state["written"] += gap
+                    state["gap_frames"] += gap
+                elif expected < state["written"] - self.tolerance_frames:
+                    state["negative_drift_events"] += 1
+
+            pcm = float_to_pcm16(np.asarray(samples, dtype=np.float32).reshape(-1))
+            state["writer"].writeframes(pcm.tobytes())
+            state["written"] += len(pcm)
+            # wave.writeframes already re-patches the RIFF sizes on every call,
+            # so the only thing missing after an abrupt kill is whatever sits in
+            # the OS buffer. flush() closes that window too.
+            state["fileobj"].flush()
+
+    def sidecar_payload(self):
+        # Pure: builds the dict without touching disk, so its shape is
+        # testable on its own.
+        streams = {}
+        for source, state in self._streams.items():
+            meta = self.source_meta.get(source, {})
+            streams[source] = {
+                "wav": os.path.basename(state["path"]),
+                "device": meta.get("device"),
+                "device_rate": meta.get("device_rate"),
+                "first_block_wall": state["first_block_wall"],
+                "frames": state["written"],
+                "seconds": state["written"] / float(self.sample_rate),
+                "gap_frames": state["gap_frames"],
+                "negative_drift_events": state["negative_drift_events"],
+            }
+        return {
+            "schema": SIDECAR_SCHEMA_VERSION,
+            "transcript": os.path.basename(self.transcript_path),
+            "sample_rate": self.sample_rate,
+            "session_start_wall": self.session_start_wall,
+            "streams": streams,
+        }
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for state in self._streams.values():
+                try:
+                    state["writer"].close()  # patches the RIFF/data sizes
+                finally:
+                    state["fileobj"].close()
+            if not self._streams:
+                return
+            payload = self.sidecar_payload()
+
+        # Written atomically so a reader can never see a half-written sidecar:
+        # os.replace is atomic within a filesystem.
+        tmp_path = self.sidecar_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp_path, self.sidecar_path)
+
+
 def ready_source(buffers, min_chunk_seconds, max_chunk_seconds):
     for source, buf in buffers.items():
         secs = buf.seconds()
@@ -1095,7 +1300,7 @@ def line_timestamp(chunk_start_time, offset_seconds):
     return moment.strftime("%H:%M:%S")
 
 
-def transcribe_loop(model, audio_queue, output_file, settings, source_rates, worker_error):
+def transcribe_loop(model, audio_queue, output_file, settings, source_rates, worker_error, recorder=None):
     # Consumer thread: pulls (source, raw block, capture time) tuples off the
     # queue, downmixes + resamples them (kept off the real-time callback
     # thread, AUDIT #1), accumulates them per source via SourceBuffer.setdefault
@@ -1117,6 +1322,12 @@ def transcribe_loop(model, audio_queue, output_file, settings, source_rates, wor
                     mono = mono.mean(axis=1)  # average channels to mono
                 mono = mono.reshape(-1)
                 mono = resample_to_target(mono, source_rates[source])
+
+                # Record BEFORE prepare_audio: the diarizer needs the silence
+                # (it is what separates turns) and the original levels, both of
+                # which the transcription path deliberately removes.
+                if recorder is not None:
+                    recorder.write(source, mono, capture_time)
 
                 buf = buffers.setdefault(source, SourceBuffer())
                 buf.append(mono, capture_time)
@@ -1237,10 +1448,24 @@ def main():
     blackhole_rate = device_sample_rate(devices, blackhole_index)
     source_rates = {SOURCE_YOU: mic_rate, SOURCE_OTHERS: blackhole_rate}
 
+    recorder = None
+    if settings.record:
+        recorder = StreamRecorder(
+            output_file,
+            source_meta={
+                SOURCE_YOU: {"device": mic_name, "device_rate": mic_rate},
+                SOURCE_OTHERS: {"device": blackhole_name, "device_rate": blackhole_rate},
+            },
+        )
+
     print("")
     print(f"Mic input     : {mic_name}")
     print(f"Remote input  : {blackhole_name}")
     print(f"Transcript    : {output_file}")
+    if recorder is not None:
+        for path in recorder.paths():
+            print(f"Recording     : {path}")
+        print(f"Stream info   : {recorder.sidecar_path}")
 
     print_settings(settings, local=not settings.remote_url)
 
@@ -1262,7 +1487,7 @@ def main():
     worker_error = threading.Event()
     worker = threading.Thread(
         target=transcribe_loop,
-        args=(model, audio_queue, output_file, settings, source_rates, worker_error),
+        args=(model, audio_queue, output_file, settings, source_rates, worker_error, recorder),
         daemon=True,
     )
     worker.start()
@@ -1294,6 +1519,15 @@ def main():
         print(f"\nTranscription saved to: {output_file}")
     except sd.PortAudioError as exc:
         print(f"\nError: could not open an audio stream: {exc}")
+    finally:
+        # Runs on Ctrl+C, on a PortAudio failure, and on the worker-death
+        # sys.exit above (SystemExit still unwinds), so the WAV headers and the
+        # sidecar are finalized on every exit path this function has.
+        if recorder is not None:
+            recorder.close()
+            if os.path.exists(recorder.sidecar_path):
+                print("Recordings saved. Diarize with:")
+                print(f"  python diarize.py {recorder.sidecar_path}")
 
 
 if __name__ == "__main__":

@@ -235,6 +235,10 @@ bin/*
 *.jpg
 
 transcripts/
+# Meeting audio from `transcribe.py --record`. It normally lands in
+# transcripts/ (already ignored), but this catches recordings written
+# anywhere else -- raw meeting audio must never be committed.
+*.wav
 venv/
 notes/
 outputs/

@@ -14,9 +14,12 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import wave
 
 import numpy as np
 
+import diarize
 import transcribe
 
 FAILURES = []
@@ -69,6 +72,7 @@ def _make_namespace(**overrides):
         initial_prompt="",
         input_file="",
         remote_url="",
+        record=False,
     )
     for key, value in overrides.items():
         setattr(ns, key, value)
@@ -613,6 +617,454 @@ def test_line_timestamp_uses_capture_time():
     check("missing clock still produces a timestamp", len(transcribe.line_timestamp(None, 0.0)) == 8)
 
 
+def _read_wav(path):
+    with wave.open(path, "rb") as handle:
+        frames = handle.getnframes()
+        raw = handle.readframes(frames)
+        return handle.getnchannels(), handle.getsampwidth(), handle.getframerate(), frames, raw
+
+
+def test_float_to_pcm16():
+    out = transcribe.float_to_pcm16(np.array([0.0, 1.0, -1.0], dtype=np.float32))
+    check("dtype is int16", out.dtype == np.int16, str(out.dtype))
+    check("silence maps to 0", out[0] == 0, str(out[0]))
+    check("full scale maps to +32767", out[1] == 32767, str(out[1]))
+    check("negative full scale maps to -32767", out[2] == -32767, str(out[2]))
+
+    # prepare_audio's gain can overshoot 1.0; wrapping instead of saturating
+    # would turn a loud sample into loud noise of the opposite sign.
+    clipped = transcribe.float_to_pcm16(np.array([4.0, -4.0], dtype=np.float32))
+    check("overshoot saturates positive", clipped[0] == 32767, str(clipped[0]))
+    check("overshoot saturates negative", clipped[1] == -32767, str(clipped[1]))
+
+
+def test_detect_gap_frames():
+    tol = int(transcribe.RECORD_GAP_TOLERANCE_SECONDS * transcribe.TARGET_SAMPLE_RATE)
+    check("aligned stream inserts nothing", transcribe.detect_gap_frames(1000, 1000, tol) == 0)
+    check("jitter under tolerance inserts nothing", transcribe.detect_gap_frames(1000 + tol, 1000, tol) == 0)
+    dropped = transcribe.detect_gap_frames(16000 + 1000, 1000, tol)
+    check("a one-second drop inserts one second", dropped == 16000, str(dropped))
+    check("negative drift never trims", transcribe.detect_gap_frames(500, 5000, tol) == 0)
+
+
+def test_stream_recorder_roundtrip():
+    with tempfile.TemporaryDirectory() as tmp:
+        transcript = os.path.join(tmp, "meeting.txt")
+        recorder = transcribe.StreamRecorder(
+            transcript,
+            source_meta={transcribe.SOURCE_YOU: {"device": "Mic", "device_rate": 48000}},
+        )
+        block = np.full(1600, 0.5, dtype=np.float32)  # 0.1s at 16 kHz
+        t0 = 1000.0
+        recorder.write(transcribe.SOURCE_YOU, block, t0)
+        recorder.write(transcribe.SOURCE_YOU, block, t0 + 0.1)
+        recorder.write(transcribe.SOURCE_OTHERS, block, t0 + 0.05)
+        recorder.close()
+
+        you_path = os.path.join(tmp, "meeting_you.wav")
+        check("You wav exists", os.path.exists(you_path))
+        check("Others wav exists", os.path.exists(os.path.join(tmp, "meeting_others.wav")))
+
+        channels, width, rate, frames, raw = _read_wav(you_path)
+        check("mono", channels == 1, str(channels))
+        check("16-bit", width == 2, str(width))
+        check("16 kHz", rate == transcribe.TARGET_SAMPLE_RATE, str(rate))
+        check("both blocks written", frames == 3200, str(frames))
+        samples = np.frombuffer(raw, dtype=np.int16)
+        check("audio survives the round trip", abs(int(samples[0]) - 16383) <= 2, str(samples[0]))
+
+        sidecar = os.path.join(tmp, "meeting_streams.json")
+        check("sidecar exists", os.path.exists(sidecar))
+        with open(sidecar, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        check("schema is stamped", payload["schema"] == transcribe.SIDECAR_SCHEMA_VERSION)
+        check("sidecar names the transcript", payload["transcript"] == "meeting.txt")
+        check("both streams described", sorted(payload["streams"]) == ["Others", "You"])
+        you = payload["streams"][transcribe.SOURCE_YOU]
+        check("frame count recorded", you["frames"] == 3200, str(you["frames"]))
+        check("capture clock recorded", you["first_block_wall"] == t0, str(you["first_block_wall"]))
+        check("device metadata recorded", you["device"] == "Mic", str(you["device"]))
+        check("wav referenced by basename", you["wav"] == "meeting_you.wav", you["wav"])
+        check("no gaps on a clean stream", you["gap_frames"] == 0, str(you["gap_frames"]))
+
+
+def test_stream_recorder_gap_fill():
+    # PortAudio dropping audio must stretch the file, not compress the
+    # timeline -- otherwise every later diarized timestamp slides earlier.
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = transcribe.StreamRecorder(os.path.join(tmp, "m.txt"))
+        block = np.full(1600, 0.2, dtype=np.float32)  # 0.1s
+        recorder.write(transcribe.SOURCE_OTHERS, block, 500.0)
+        recorder.write(transcribe.SOURCE_OTHERS, block, 501.1)  # 1.0s late
+        recorder.close()
+
+        _, _, _, frames, _ = _read_wav(os.path.join(tmp, "m_others.wav"))
+        check("silence inserted for the drop", frames == 1600 + 16000 + 1600, str(frames))
+        with open(os.path.join(tmp, "m_streams.json"), encoding="utf-8") as handle:
+            stream = json.load(handle)["streams"][transcribe.SOURCE_OTHERS]
+        check("gap frames counted", stream["gap_frames"] == 16000, str(stream["gap_frames"]))
+
+        # A backwards clock step is counted, never repaired by discarding audio.
+        recorder2 = transcribe.StreamRecorder(os.path.join(tmp, "n.txt"))
+        recorder2.write(transcribe.SOURCE_OTHERS, block, 900.0)
+        recorder2.write(transcribe.SOURCE_OTHERS, block, 899.0)
+        recorder2.close()
+        _, _, _, frames2, _ = _read_wav(os.path.join(tmp, "n_others.wav"))
+        check("negative drift keeps every sample", frames2 == 3200, str(frames2))
+        with open(os.path.join(tmp, "n_streams.json"), encoding="utf-8") as handle:
+            stream2 = json.load(handle)["streams"][transcribe.SOURCE_OTHERS]
+        check("negative drift is reported", stream2["negative_drift_events"] == 1)
+
+
+def test_stream_recorder_unknown_source():
+    # Same defensive stance as SourceBuffer.setdefault (AUDIT #4): an
+    # unrecognized label must not raise.
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = transcribe.StreamRecorder(os.path.join(tmp, "m.txt"))
+        recorder.write("Room Mic", np.zeros(160, dtype=np.float32), 5.0)
+        recorder.close()
+        check("unknown label gets its own file", os.path.exists(os.path.join(tmp, "m_room_mic.wav")))
+
+
+def test_transcribe_loop_records():
+    # The regression guard for the tap point: audio quiet enough that
+    # prepare_audio drops it must still reach the WAV, because silence is what
+    # separates speaker turns for the diarizer.
+    quiet = np.full(
+        transcribe.TARGET_SAMPLE_RATE * 30, transcribe.SILENCE_RMS / 10, dtype=np.float32
+    )
+    model = FakeModel([])
+    q = queue.Queue()
+    q.put((transcribe.SOURCE_OTHERS, quiet.reshape(-1, 1), 100.0))
+    worker_error = threading.Event()
+    settings = _make_fake_args(record=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        output_file = os.path.join(tmp, "out.txt")
+        recorder = transcribe.StreamRecorder(output_file)
+        source_rates = {
+            transcribe.SOURCE_YOU: transcribe.TARGET_SAMPLE_RATE,
+            transcribe.SOURCE_OTHERS: transcribe.TARGET_SAMPLE_RATE,
+        }
+        thread = threading.Thread(
+            target=transcribe.transcribe_loop,
+            args=(model, q, output_file, settings, source_rates, worker_error, recorder),
+            daemon=True,
+        )
+        thread.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and not recorder._streams.get(transcribe.SOURCE_OTHERS):
+            time.sleep(0.01)
+        time.sleep(0.2)
+        recorder.close()
+
+        check("worker did not crash", not worker_error.is_set())
+        path = os.path.join(tmp, "out_others.wav")
+        check("silent audio was still recorded", os.path.exists(path))
+        if os.path.exists(path):
+            _, _, _, frames, _ = _read_wav(path)
+            check("every sample reached the wav", frames == len(quiet), str(frames))
+        size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
+        check("prepare_audio still dropped it from the transcript", size == 0, str(size))
+
+
+def test_record_settings_validation():
+    check("record defaults off", _make_fake_args().record is False)
+    check("record is on when asked", _make_fake_args(record=True).record is True)
+
+    try:
+        _make_fake_args(record=True, input_file="/tmp/x.wav")
+        check("--record with --input-file is rejected", False, "no error raised")
+    except ValueError as exc:
+        check("--record with --input-file is rejected", "nothing to record" in str(exc), str(exc))
+
+    os.environ["WHISPER_RECORD"] = "1"
+    try:
+        check("WHISPER_RECORD=1 enables recording", _make_fake_args().record is True)
+    finally:
+        os.environ.pop("WHISPER_RECORD")
+    os.environ["WHISPER_RECORD"] = "0"
+    try:
+        check("WHISPER_RECORD=0 leaves it off", _make_fake_args().record is False)
+    finally:
+        os.environ.pop("WHISPER_RECORD")
+
+
+class _FakeSegmentSpan:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+
+class _FakeAnnotation:
+    # Duck-types the one pyannote.core API diarize.py uses, so the adapter is
+    # tested without installing torch.
+    def __init__(self, tracks):
+        self._tracks = tracks
+
+    def itertracks(self, yield_label=False):
+        for start, end, label in self._tracks:
+            if yield_label:
+                yield _FakeSegmentSpan(start, end), "_", label
+            else:
+                yield _FakeSegmentSpan(start, end), "_"
+
+
+def _turns(*spans):
+    return [diarize.SpeakerTurn(start, end, label) for start, end, label in spans]
+
+
+def test_diarize_lazy_import():
+    # The dependency-isolation guarantee: diarize.py must import and run its
+    # non-diarization paths on a machine with neither torch nor pyannote.
+    #
+    # Asserting `"torch" not in sys.modules` would be the wrong test: once
+    # torch IS installed, ctranslate2/specs/model_spec.py imports it
+    # opportunistically, so faster_whisper -> ctranslate2 -> torch happens via
+    # `import transcribe` and has nothing to do with this module. So instead we
+    # hide both packages and check the import still succeeds.
+    check("diarize imported", "diarize" in sys.modules)
+    check("pyannote not imported at module level", not any(m.startswith("pyannote") for m in sys.modules))
+
+    blocker = (
+        "import sys\n"
+        "class Block:\n"
+        "    def find_module(self, name, path=None):\n"
+        "        if name == 'torch' or name.startswith('pyannote'):\n"
+        "            raise ImportError('hidden by selftest: ' + name)\n"
+        "        return None\n"
+        "sys.meta_path.insert(0, Block())\n"
+        "import diarize\n"
+        "assert diarize.overlap_seconds(0, 2, 1, 3) == 1.0\n"
+        "assert 'Others 1' in diarize.number_others([('S', 0.0)]).values()\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", blocker],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    check(
+        "diarize imports and works with torch/pyannote hidden",
+        result.returncode == 0 and "OK" in result.stdout,
+        (result.stderr or result.stdout)[-300:],
+    )
+
+
+def test_read_wav_mono16_truncated_header():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.wav")
+        samples = (np.sin(np.linspace(0, 20, 8000)) * 0.5).astype(np.float32)
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(transcribe.TARGET_SAMPLE_RATE)
+            handle.writeframes(transcribe.float_to_pcm16(samples).tobytes())
+
+        audio = diarize.read_wav_mono16(path)
+        check("clean wav reads back in full", len(audio) == 8000, str(len(audio)))
+        check("amplitude preserved", abs(float(np.max(audio)) - float(np.max(samples))) < 0.01)
+
+        # Simulate a writer killed before it could patch the header: zero the
+        # data-chunk size. The file length is the ground truth.
+        raw = bytearray(open(path, "rb").read())
+        index = raw.find(b"data")
+        raw[index + 4:index + 8] = (0).to_bytes(4, "little")
+        broken = os.path.join(tmp, "broken.wav")
+        open(broken, "wb").write(bytes(raw))
+
+        with wave.open(broken, "rb") as handle:
+            check("stdlib wave sees a truncated file", handle.getnframes() == 0, str(handle.getnframes()))
+        recovered = diarize.read_wav_mono16(broken)
+        check("truncated header still recovers every sample", len(recovered) == 8000, str(len(recovered)))
+
+
+def test_read_wav_mono16_stereo_and_rate():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "s.wav")
+        left = np.full(1000, 0.5, dtype=np.float32)
+        right = np.full(1000, -0.1, dtype=np.float32)
+        interleaved = np.empty(2000, dtype=np.float32)
+        interleaved[0::2] = left
+        interleaved[1::2] = right
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(2)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(transcribe.float_to_pcm16(interleaved).tobytes())
+
+        audio = diarize.read_wav_mono16(path)
+        check("stereo is downmixed and resampled", len(audio) == 2000, str(len(audio)))
+        check("downmix averages the channels", abs(float(np.mean(audio)) - 0.2) < 0.02, str(np.mean(audio)))
+
+
+def test_turns_from_annotation():
+    annotation = _FakeAnnotation([(3.0, 4.0, "SPEAKER_01"), (0.0, 2.0, "SPEAKER_00")])
+    turns = diarize.turns_from_annotation(annotation)
+    check("turns are sorted by start", [t.start for t in turns] == [0.0, 3.0], str([t.start for t in turns]))
+    check("labels preserved", turns[0].raw == "SPEAKER_00", turns[0].raw)
+
+
+def test_overlap_seconds():
+    check("no overlap", diarize.overlap_seconds(0, 1, 2, 3) == 0.0)
+    check("touching is not overlapping", diarize.overlap_seconds(0, 2, 2, 3) == 0.0)
+    check("partial overlap", diarize.overlap_seconds(0, 2, 1, 3) == 1.0)
+    check("containment", diarize.overlap_seconds(1, 2, 0, 5) == 1.0)
+
+
+def test_assign_speaker():
+    turns = _turns((0.0, 10.0, "A"), (10.0, 20.0, "B"))
+    raw, shares, straddled = diarize.assign_speaker(1.0, 3.0, turns)
+    check("fully contained segment gets its speaker", raw == "A", str(raw))
+    check("shares are reported", round(shares["A"], 3) == 2.0, str(shares))
+    check("contained segment does not straddle", straddled is False)
+
+    # A short interjection in the middle must NOT win the line: this is the
+    # case midpoint-matching gets wrong.
+    interrupted = _turns((0.0, 4.0, "A"), (4.0, 4.3, "B"), (4.3, 9.0, "A"))
+    raw, _, straddled = diarize.assign_speaker(0.0, 9.0, interrupted)
+    check("a backchannel does not steal the line", raw == "A", str(raw))
+    check("a backchannel is not a straddle", straddled is False)
+
+    raw, _, straddled = diarize.assign_speaker(8.0, 12.0, turns)
+    check("a real speaker change is flagged", straddled is True)
+    check("the majority speaker still wins", raw in ("A", "B"), str(raw))
+
+    raw, shares, _ = diarize.assign_speaker(30.0, 31.0, turns)
+    check("no overlap falls back to the nearest turn", raw == "B", str(raw))
+    check("fallback reports no shares", shares == {}, str(shares))
+
+    raw, shares, straddled = diarize.assign_speaker(0.0, 1.0, [])
+    check("no turns means no speaker", raw is None, str(raw))
+
+
+def test_number_others_stable():
+    # (raw_label, segment_start) pairs, as main() collects them.
+    assignments = [("SPEAKER_07", 12.0), ("SPEAKER_02", 3.0), ("SPEAKER_07", 30.0)]
+    naming = diarize.number_others(assignments)
+    check("first voice heard is Others 1", naming["SPEAKER_02"] == "Others 1", str(naming))
+    check("second voice heard is Others 2", naming["SPEAKER_07"] == "Others 2", str(naming))
+    check("only speaking labels are numbered", len(naming) == 2, str(naming))
+
+    reversed_naming = diarize.number_others(list(reversed(assignments)))
+    check("numbering ignores input order", reversed_naming == naming, str(reversed_naming))
+
+    check("unassigned segments are skipped", diarize.number_others([(None, 1.0)]) == {})
+
+
+def test_merge_timeline_ordering():
+    you = diarize.DiarizedLine(offset=5.0, wall=None, stream=transcribe.SOURCE_YOU, text="mine")
+    other = diarize.DiarizedLine(offset=1.0, wall=None, stream=transcribe.SOURCE_OTHERS, text="theirs")
+    tie = diarize.DiarizedLine(offset=5.0, wall=None, stream=transcribe.SOURCE_OTHERS, text="tie")
+    merged = diarize.merge_timeline([you, other, tie])
+    check("earlier line comes first", merged[0].text == "theirs", merged[0].text)
+    check("You wins an exact tie", merged[1].text == "mine", merged[1].text)
+
+
+def test_format_line():
+    line = diarize.DiarizedLine(offset=65.0, wall=1757000000.0, stream=transcribe.SOURCE_OTHERS, text="hello")
+    line.label = "Others 2"
+    line.straddled = True
+
+    check("offset mode uses the session clock", diarize.format_line(line, use_offsets=True) == "[00:01:05] Others 2: hello")
+    wall_rendered = diarize.format_line(line)
+    check("wall mode uses HH:MM:SS", len(wall_rendered.split("]")[0]) == 9, wall_rendered)
+    check("uncertainty is off by default", "[?]" not in wall_rendered, wall_rendered)
+    check("uncertainty can be marked", diarize.format_line(line, True, True).endswith("[?]"))
+
+    clockless = diarize.DiarizedLine(offset=1.0, wall=None, stream=transcribe.SOURCE_YOU, text="x")
+    check("a missing clock falls back to offsets", diarize.format_line(clockless) == "[00:00:01] You: x")
+
+
+def test_resolve_hf_token():
+    check("env token wins", diarize.resolve_hf_token({"HF_TOKEN": "hf_a"}) == "hf_a")
+    check("second env name is honoured", diarize.resolve_hf_token({"HUGGINGFACE_HUB_TOKEN": "hf_b"}) == "hf_b")
+    check("HF_TOKEN takes precedence", diarize.resolve_hf_token({"HF_TOKEN": "hf_a", "HUGGINGFACE_HUB_TOKEN": "hf_b"}) == "hf_a")
+    check("blank is not a token", diarize.resolve_hf_token({"HF_TOKEN": "   "}) in (None, diarize.resolve_hf_token({})))
+
+
+def test_report_diarizer_load_failure_messages():
+    missing = diarize.report_diarizer_load_failure(ImportError("No module named 'pyannote'"))
+    check("missing package points at the requirements file", diarize.REQUIREMENTS_FILE in missing, missing)
+    check("missing package says transcribe.py is unaffected", "transcribe.py does not need it" in missing)
+
+    gated = diarize.report_diarizer_load_failure(RuntimeError("401 Client Error: Unauthorized, repo is gated"))
+    check("gated error links the model page", diarize.MODEL_URL in gated, gated)
+    check("gated error links the token page", diarize.TOKEN_URL in gated, gated)
+
+    # pyannote signals "no access" two ways: it raises for a gated repo, but
+    # returns None when from_pretrained cannot build the pipeline. Both must
+    # produce the same instructions.
+    returned_none = diarize.report_diarizer_load_failure(
+        diarize.DiarizerAccessError("from_pretrained returned None")
+    )
+    check("a None pipeline gets the same instructions", diarize.MODEL_URL in returned_none, returned_none)
+
+    offline = diarize.report_diarizer_load_failure(RuntimeError("LocalEntryNotFoundError: offline mode"))
+    check("offline error explains the cache", "cache" in offline.lower(), offline)
+
+    network = diarize.report_diarizer_load_failure(RuntimeError("Connection timed out"))
+    check("network error is classified", "huggingface.co" in network, network)
+
+    other = diarize.report_diarizer_load_failure(RuntimeError("something else entirely"))
+    check("unclassified errors still surface", "something else entirely" in other, other)
+
+
+def test_diarize_cli_validation():
+    def run(*flags):
+        return subprocess.run(
+            [sys.executable, "diarize.py", *flags],
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+
+    helped = run("--help")
+    check("--help exits 0", helped.returncode == 0, helped.stderr[:200])
+    check("--help documents --num-speakers", "--num-speakers" in helped.stdout)
+    check("--help documents --no-diarize", "--no-diarize" in helped.stdout)
+
+    check("an input is required", run().returncode != 0)
+    check(
+        "exact and bounded speaker counts are exclusive",
+        run("x_streams.json", "--num-speakers", "2", "--min-speakers", "1").returncode != 0,
+    )
+    check(
+        "sidecar and loose wavs are exclusive",
+        run("x_streams.json", "--others-wav", "a.wav").returncode != 0,
+    )
+    check(
+        "min cannot exceed max",
+        run("x_streams.json", "--min-speakers", "5", "--max-speakers", "2").returncode != 0,
+    )
+    missing = run("does_not_exist_streams.json", "--no-diarize")
+    check("a missing sidecar exits non-zero", missing.returncode != 0, missing.stdout[:200])
+
+
+def test_load_streams_sidecar():
+    with tempfile.TemporaryDirectory() as tmp:
+        recorder = transcribe.StreamRecorder(os.path.join(tmp, "m.txt"))
+        block = np.full(1600, 0.3, dtype=np.float32)
+        recorder.write(transcribe.SOURCE_YOU, block, 10.0)
+        recorder.write(transcribe.SOURCE_OTHERS, block, 10.5)
+        recorder.close()
+
+        payload = diarize.load_streams_sidecar(recorder.sidecar_path)
+        check("both streams resolved", sorted(payload["streams"]) == ["Others", "You"])
+        check("paths resolved next to the sidecar", os.path.isfile(payload["streams"]["You"]["path"]))
+
+        # A sidecar from a different schema must fail loudly rather than be
+        # half-understood.
+        bad = os.path.join(tmp, "bad_streams.json")
+        with open(bad, "w", encoding="utf-8") as handle:
+            json.dump({"schema": 999, "streams": {}}, handle)
+        try:
+            diarize.load_streams_sidecar(bad)
+            check("an unknown schema is rejected", False, "no error raised")
+        except ValueError as exc:
+            check("an unknown schema is rejected", "schema" in str(exc), str(exc))
+
+
 def main():
     print("=" * 70)
     print("transcribe.py self-test (no audio hardware, no model download)")
@@ -645,6 +1097,26 @@ def main():
         test_decode_options_reach_the_model,
         test_remote_fields_projected_from_options,
         test_line_timestamp_uses_capture_time,
+        test_float_to_pcm16,
+        test_detect_gap_frames,
+        test_stream_recorder_roundtrip,
+        test_stream_recorder_gap_fill,
+        test_stream_recorder_unknown_source,
+        test_transcribe_loop_records,
+        test_record_settings_validation,
+        test_diarize_lazy_import,
+        test_read_wav_mono16_truncated_header,
+        test_read_wav_mono16_stereo_and_rate,
+        test_turns_from_annotation,
+        test_overlap_seconds,
+        test_assign_speaker,
+        test_number_others_stable,
+        test_merge_timeline_ordering,
+        test_format_line,
+        test_resolve_hf_token,
+        test_report_diarizer_load_failure_messages,
+        test_diarize_cli_validation,
+        test_load_streams_sidecar,
     ]
 
     for test in tests:
