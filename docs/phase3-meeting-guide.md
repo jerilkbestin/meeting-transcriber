@@ -29,7 +29,7 @@ hf auth login                             # paste a read token from
 ```
 
 Accept the model terms once at
-<https://huggingface.co/pyannote/speaker-diarization-community-1>.
+[https://huggingface.co/pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1).
 
 `hf auth login` stores the token in `~/.cache/huggingface/token`, so it
 survives restarts and needs no `HF_TOKEN` export. After the first run the model
@@ -105,10 +105,10 @@ was captured, not when the line was printed.
 
 Two things are worth reacting to:
 
-| What you see | What it means | What to do |
-| --- | --- | --- |
-| `Warning: transcription is behind by about N seconds` and N keeps growing | Decoding is slower than real time | Nothing mid-meeting - the recording and timestamps stay correct. Next time use `--accuracy fast` |
-| `Others stream status: input overflow` | The machine dropped audio blocks | Close heavy apps. The recorder fills the gap with silence so the timeline stays aligned |
+| What you see                                                                | What it means                     | What to do                                                                                        |
+| --------------------------------------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `Warning: transcription is behind by about N seconds` and N keeps growing | Decoding is slower than real time | Nothing mid-meeting - the recording and timestamps stay correct. Next time use`--accuracy fast` |
+| `Others stream status: input overflow`                                    | The machine dropped audio blocks  | Close heavy apps. The recorder fills the gap with silence so the timeline stays aligned           |
 
 **Do not run `diarize.py` while the meeting is running.** It would compete for
 the same CPU the live transcription needs.
@@ -151,11 +151,11 @@ python diarize.py transcripts/..._streams.json --min-speakers 2 --max-speakers 5
 
 Measured on this M4, CPU:
 
-| Stage | Speed | For a 1-hour meeting |
-| --- | --- | --- |
-| Diarization (`Others` only) | RTF 0.38 | about 23 minutes |
-| Re-transcription, `--accuracy max` (default) | RTF ~0.50 per stream | about 60 minutes for both streams |
-| Re-transcription, `--accuracy balanced` | RTF ~0.27 per stream | about 32 minutes for both streams |
+| Stage                                         | Speed                | For a 1-hour meeting              |
+| --------------------------------------------- | -------------------- | --------------------------------- |
+| Diarization (`Others` only)                 | RTF 0.38             | about 23 minutes                  |
+| Re-transcription,`--accuracy max` (default) | RTF ~0.50 per stream | about 60 minutes for both streams |
+| Re-transcription,`--accuracy balanced`      | RTF ~0.27 per stream | about 32 minutes for both streams |
 
 So a 1-hour meeting takes roughly **1h20m at the default**, or about **55
 minutes** with `--accuracy balanced`. Start it and go do something else; it
@@ -238,16 +238,16 @@ sed -i '' 's/Others 1:/Priya:/g; s/Others 2:/Marc:/g' \
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| No `Recording` lines in the startup banner | `--record` missing | Restart with `--record`. Cannot be fixed after the fact |
-| `Others` transcript is empty or silent | Teams speaker is not the Multi-Output Device | Set it in Teams → Devices, re-run `switch_meeting_output` if the device is gone |
-| `BlackHole 2ch was not found as an input device` | BlackHole not installed or not visible | Check Audio MIDI Setup; reinstall BlackHole if absent |
-| `access to pyannote/... has not been granted` | Terms not accepted, or no token | Accept at the model page, then `hf auth login` |
-| `pyannote.audio is not installed` | Diarization deps missing | `pip install -r requirements-diarize.txt` |
-| Everyone lands in one `Others 1` | Voices too similar, or the clustering merged them | Re-run with `--num-speakers N` |
-| One person split into two labels | Clustering over-split, often from varying mic quality | Re-run with `--num-speakers N` |
-| `objc[...] Class AVFFrameReceiver is implemented in both...` | PyAV and Homebrew ffmpeg both loaded | Harmless, ignore |
+| Symptom                                                        | Cause                                                 | Fix                                                                               |
+| -------------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------- |
+| No`Recording` lines in the startup banner                    | `--record` missing                                  | Restart with`--record`. Cannot be fixed after the fact                          |
+| `Others` transcript is empty or silent                       | Teams speaker is not the Multi-Output Device          | Set it in Teams → Devices, re-run`switch_meeting_output` if the device is gone |
+| `BlackHole 2ch was not found as an input device`             | BlackHole not installed or not visible                | Check Audio MIDI Setup; reinstall BlackHole if absent                             |
+| `access to pyannote/... has not been granted`                | Terms not accepted, or no token                       | Accept at the model page, then`hf auth login`                                   |
+| `pyannote.audio is not installed`                            | Diarization deps missing                              | `pip install -r requirements-diarize.txt`                                       |
+| Everyone lands in one`Others 1`                              | Voices too similar, or the clustering merged them     | Re-run with`--num-speakers N`                                                   |
+| One person split into two labels                               | Clustering over-split, often from varying mic quality | Re-run with`--num-speakers N`                                                   |
+| `objc[...] Class AVFFrameReceiver is implemented in both...` | PyAV and Homebrew ffmpeg both loaded                  | Harmless, ignore                                                                  |
 
 ---
 
