@@ -629,6 +629,10 @@ python transcribe.py --record
 python diarize.py transcripts/<name>_<timestamp>_streams.json
 ```
 
+Step-by-step for an actual meeting - routing, what to watch during the call,
+how long the post pass takes, and troubleshooting - is in
+**`docs/phase3-meeting-guide.md`**.
+
 Output, beside the live transcript:
 
 ```text
@@ -683,8 +687,13 @@ Notes:
   (Windows RTX4050 FastAPI service) — separate infrastructure work not yet
   started; see `docs/project-local-NW-model-setup.md`.
 
-See `project.md` and `phase2_audio_routing_plan.md` for the full brief, and
-`AUDIT.md` for the (now-resolved) code-quality findings.
+See `docs/project.md` and `docs/phase2_audio_routing_plan.md` for the full
+brief, and `docs/AUDIT.md` for the (now-resolved) code-quality findings.
+For running a real meeting with diarization end to end, see
+**`docs/phase3-meeting-guide.md`**.
+
+(`project.md` and `phase2_audio_routing_plan.md` also exist at the repo root as
+duplicates of the `docs/` copies. Treat `docs/` as canonical.)
 
 ---
 
